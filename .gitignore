@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build outputs
+build/
+build_release_tmp/
+dist/
+release/
+*.spec.bak
+
+# Packaged binaries and archives
+*.exe
+*.zip
+
+# Logs and debug output
+*.log
+aramgg_debug/
+source_debug/
+provider_debug/
+debug_*/
+
+# Local data caches
+hextech_reco_cache*.json
+hextech_augment_index*.json
+debug_*.json
+
+# IDE / local
+.idea/
+.vscode/
+.claude/
