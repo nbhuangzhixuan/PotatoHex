@@ -1,4 +1,8 @@
-﻿# PotatoHex
+﻿<p align="center">
+  <img src="assets/icon.png" alt="PotatoHex" width="180">
+</p>
+
+# PotatoHex
 
 英雄联盟海克斯大乱斗助手。
 
