@@ -1,17 +1,40 @@
 ﻿# PotatoHex
 
-Windows desktop helper for League of Legends ARAM hextech recommendations.
+英雄联盟海克斯大乱斗助手。
 
-## Entry
+根据英雄推荐海克斯组合，自动识别海克斯胜率与选取率。
 
-- `launcher.py`
-- `main.py`
+## 功能
 
-## Author
+- 根据当前英雄推荐海克斯强化组合
+- 自动识别海克斯胜率、选取率
+- 启动器一键启动主程序
+- 支持本地缓存与自动刷新
 
-- `则暮`
+## 使用方法
 
-## Notes
+1. 打开 `launcher.exe`
+2. 点击 `启动`
+3. 进入游戏后在海克斯大乱斗页面使用
 
-- Do not commit `build/`, `build_release_tmp/`, `__pycache__/`, `.exe`, `.zip`, `.log`, or cache files.
-- The code uses a web data source at `aramgg.com`.
+## 注意事项
+
+- 游戏窗口请使用无边框模式
+- 不要使用全屏模式
+- 首次启动可能会自动安装缺失依赖
+- 运行目录下不要删除 `main.exe`、`launcher.exe` 和必要的缓存文件
+
+## 文件说明
+
+- `launcher.exe`: 启动器
+- `main.exe`: 主程序
+- `requirements.txt`: 依赖列表
+
+## 预览图
+
+后续可在这里放项目截图。
+
+## 说明
+
+- 项目基于网页数据源提供推荐信息
+- 适合 ARAM 海克斯大乱斗场景
