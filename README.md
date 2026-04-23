@@ -12,7 +12,7 @@
 
 ## 下载
 
-- 前往 GitHub Releases 下载 `hexhelper_v1.3.zip`
+- 前往 GitHub Releases 下载 `hexhelper_v1.4.zip`
 - 解压后运行 `launcher.exe`
 
 ## 使用方法
