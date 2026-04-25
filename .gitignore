@@ -9,7 +9,6 @@ build/
 build_release_tmp/
 dist/
 release/
-release_final*/
 *.spec.bak
 
 # Packaged binaries and archives
@@ -32,4 +31,3 @@ debug_*.json
 .idea/
 .vscode/
 .claude/
-PotatoHex-main_v1/

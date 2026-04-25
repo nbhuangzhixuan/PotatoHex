@@ -131,27 +131,6 @@ class LauncherUI:
             anchor="w",
         ).pack(fill="x", pady=(0, 18))
 
-        hotkey_tip = tk.Frame(center, bg="#0a1730", highlightbackground="#24466f", highlightthickness=1, padx=12, pady=10)
-        hotkey_tip.pack(fill="x", pady=(0, 16))
-        tk.Label(
-            hotkey_tip,
-            text="使用说明",
-            bg="#0a1730",
-            fg=accent,
-            font=("Microsoft YaHei", 10, "bold"),
-            anchor="w",
-        ).pack(fill="x")
-        tk.Label(
-            hotkey_tip,
-            text="选人阶段会自动显示海克斯预览；进入游戏海克斯页面后，按 \\ 键可打开或关闭海克斯识别悬浮窗。",
-            bg="#0a1730",
-            fg="#dce8ff",
-            font=("Microsoft YaHei", 9),
-            justify="left",
-            wraplength=430,
-            anchor="w",
-        ).pack(fill="x", pady=(6, 0))
-
         btn_row = tk.Frame(center, bg=card)
         btn_row.pack(fill="x", pady=(0, 12))
 
@@ -308,3 +287,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
