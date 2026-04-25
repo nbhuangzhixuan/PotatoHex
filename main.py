@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 
 def _ensure_runtime_dependencies():
@@ -70,8 +71,10 @@ with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.St
 
 
 SOURCE_BASE_URL = "https://aramgg.com"
+ARAMGG_BASE_URL = SOURCE_BASE_URL
 SOURCE_CHAMPION_STATS_JSON = f"{SOURCE_BASE_URL}/data/champions-stats.json"
 SOURCE_AUGMENT_META_JSON = f"{SOURCE_BASE_URL}/data/aram-mayhem-augments.zh_cn.json"
+SOURCE_AUGMENT_ICON_BASE_URL = "https://cdn.dtodo.cn/hextech/augment-icons"
 
 __author__ = "则暮"
 __version__ = "1.0.0"
@@ -92,6 +95,30 @@ def _normalize_percent_value(v):
     if abs(num) <= 1.0:
         num *= 100.0
     return num
+
+
+def _build_augment_icon_url(icon_filename):
+    raw = os.path.basename(str(icon_filename or "").strip().replace("\\", "/"))
+    if not raw:
+        return ""
+    file_name = raw.lower()
+    if "." not in file_name:
+        file_name = f"{file_name}.png"
+    return f"{SOURCE_AUGMENT_ICON_BASE_URL}/{quote(file_name)}"
+
+
+def _augment_rarity_label(rarity_value):
+    try:
+        value = int(rarity_value)
+    except Exception:
+        value = -1
+    if value == 2:
+        return "prismatic"
+    if value == 1:
+        return "gold"
+    if value == 0:
+        return "silver"
+    return ""
 
 
 def _extract_lines_text(html_content):
@@ -370,8 +397,16 @@ class SourceHextechProvider(app.ApexHextechProvider):
             if not aug_id:
                 continue
             name = str(v.get("displayName") or v.get("name") or "").strip()
+            icon_large_url = _build_augment_icon_url(v.get("iconLarge"))
+            icon_small_url = _build_augment_icon_url(v.get("iconSmall"))
+            rarity_value = v.get("rarity")
             meta[aug_id] = {
                 "name": name,
+                "icon_url": icon_large_url or icon_small_url,
+                "icon_small_url": icon_small_url,
+                "icon_large_url": icon_large_url,
+                "rarity_value": rarity_value,
+                "rarity": _augment_rarity_label(rarity_value),
             }
         return meta
 
@@ -520,6 +555,63 @@ class SourceHextechProvider(app.ApexHextechProvider):
     def has_champion_data(self, champion_name):
         entry = self._get_live_entry(champion_name)
         return bool(entry and entry.get("recommendations"))
+
+    def get_champion_strength(self, champion_name):
+        if not champion_name or str(champion_name).startswith("ID:"):
+            return None
+        display_name = str(champion_name).split("|", 1)[0].strip() or str(champion_name).strip()
+        slug = None
+        stat_row = {}
+        with self._lock:
+            try:
+                slug, _ = self._resolve_slug_locked(champion_name)
+            except Exception:
+                slug = None
+            if slug:
+                stat_row = dict(self._champion_stats.get(str(slug), {}))
+        if not stat_row:
+            self._refresh_index()
+            with self._lock:
+                try:
+                    slug, _ = self._resolve_slug_locked(champion_name)
+                except Exception:
+                    slug = None
+                if slug:
+                    stat_row = dict(self._champion_stats.get(str(slug), {}))
+        if not stat_row:
+            return {
+                "name": display_name,
+                "tier_label": "",
+                "win_rate": None,
+                "pick_rate": None,
+                "champion_id": str(slug or ""),
+            }
+
+        tier_raw = str(stat_row.get("tier", "")).strip()
+        tier_label = f"T{tier_raw}" if tier_raw.isdigit() else ""
+        win_rate = _normalize_percent_value(stat_row.get("winRate"))
+        pick_rate = _normalize_percent_value(stat_row.get("pickRate"))
+        return {
+            "name": display_name,
+            "tier_label": tier_label,
+            "win_rate": win_rate,
+            "pick_rate": pick_rate,
+            "champion_id": str(slug or stat_row.get("championId", "") or ""),
+        }
+
+    def get_champion_strengths(self, champion_names):
+        rows = []
+        seen = set()
+        for champion_name in champion_names or []:
+            display_name = str(champion_name).split("|", 1)[0].strip() or str(champion_name).strip()
+            key = app.normalize_name_key(display_name)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            info = self.get_champion_strength(champion_name)
+            if isinstance(info, dict):
+                rows.append(dict(info))
+        return rows
 
     def get_champion_recommendation_pool(self, champion_name):
         entry = self._get_live_entry(champion_name)
@@ -690,6 +782,8 @@ class SourceHextechProvider(app.ApexHextechProvider):
                     "name": name,
                     "augment_id": augment_id,
                     "url": f"{ARAMGG_BASE_URL}/zh-CN/augments/{augment_id}",
+                    "icon_url": str((meta or {}).get("icon_url", "")).strip(),
+                    "rarity": str((meta or {}).get("rarity", "")).strip(),
                     "website_rank": website_rank,
                     "tier_label": tier_label,
                     "win_rate": win_rate,
@@ -733,6 +827,8 @@ class SourceHextechProvider(app.ApexHextechProvider):
                 {
                     "augment_id": augment_id,
                     "name": str(aug_meta.get("name", "") or "").strip(),
+                    "icon_url": str(aug_meta.get("icon_url", "") or "").strip(),
+                    "rarity": str(aug_meta.get("rarity", "") or "").strip(),
                     "website_rank": rank,
                     "tier_label": f"T{str(stat.get('tier', '')).strip()}" if str(stat.get("tier", "")).strip().isdigit() else "T3",
                     "win_rate": _to_float_safe(stat.get("win_rate")),
@@ -959,10 +1055,15 @@ class SourceHextechProvider(app.ApexHextechProvider):
         if cache and (now - float(cache.get("ts", 0))) < 12 * 60 * 60:
             return dict(cache.get("data") or {})
 
+        with self._lock:
+            if not self._augment_name_meta:
+                self._augment_name_meta = self._load_augment_name_meta()
+            base_meta = dict(self._augment_name_meta.get(str(augment_id), {}) or {})
+
         url = f"{ARAMGG_BASE_URL}/zh-CN/augments/{augment_id}"
         html_content = self._http_get(url)
         if not html_content:
-            return {}
+            return dict(base_meta)
         lines = _extract_lines_text(html_content)
 
         def _clean_name_candidate(raw):
@@ -1007,6 +1108,8 @@ class SourceHextechProvider(app.ApexHextechProvider):
                 if cand and not re.fullmatch(r"T[1-5]", cand.upper()):
                     name = cand
                     break
+        if not name:
+            name = str(base_meta.get("name", "")).strip()
 
         win = None
         pick = None
@@ -1065,6 +1168,11 @@ class SourceHextechProvider(app.ApexHextechProvider):
 
         data = {
             "name": name,
+            "icon_url": str(base_meta.get("icon_url", "")).strip(),
+            "icon_small_url": str(base_meta.get("icon_small_url", "")).strip(),
+            "icon_large_url": str(base_meta.get("icon_large_url", "")).strip(),
+            "rarity": str(base_meta.get("rarity", "")).strip(),
+            "rarity_value": base_meta.get("rarity_value"),
             "tier": tier,
             "win_rate": win,
             "pick_rate": pick,
@@ -1188,6 +1296,33 @@ class SourceHextechProvider(app.ApexHextechProvider):
             for x in top_augments
             if str(x.get("augment_id", "")).strip()
         }
+        with self._lock:
+            if not self._augment_name_meta:
+                self._augment_name_meta = self._load_augment_name_meta()
+            augment_name_meta = dict(self._augment_name_meta)
+
+        def _build_combo_members(token):
+            members = []
+            seen_member_ids = set()
+            for part in re.findall(r"\d+", str(token or "")):
+                augment_id = str(part).strip()
+                if not augment_id or augment_id in seen_member_ids:
+                    continue
+                seen_member_ids.add(augment_id)
+                meta = dict(augment_name_meta.get(augment_id, {}) or {})
+                if not meta:
+                    meta = self._parse_augment_detail_page(augment_id)
+                member_name = id_to_name.get(augment_id, "") or str(meta.get("name", "")).strip()
+                members.append(
+                    {
+                        "augment_id": augment_id,
+                        "name": member_name or f"#{augment_id}",
+                        "icon_url": str(meta.get("icon_url", "")).strip(),
+                        "rarity": str(meta.get("rarity", "")).strip(),
+                    }
+                )
+            return members
+
         def _format_combo_token(token):
             parts = [p for p in re.findall(r"\d+", str(token or "")) if p]
             named = []
@@ -1201,6 +1336,8 @@ class SourceHextechProvider(app.ApexHextechProvider):
 
         recos = []
         for idx, row in enumerate(top_augments, 1):
+            augment_id = str(row.get("augment_id", "")).strip()
+            aug_meta = augment_name_meta.get(augment_id, {}) if augment_id else {}
             website_rank = int(row.get("website_rank", idx) or idx)
             website_tier = str(row.get("tier_label") or "").strip().upper()
             if website_tier not in {"T1", "T2", "T3", "T4", "T5"}:
@@ -1210,12 +1347,16 @@ class SourceHextechProvider(app.ApexHextechProvider):
             aug_url = row.get("url", "")
             if aug_url.startswith("/"):
                 aug_url = ARAMGG_BASE_URL + aug_url
-            aug_name = str(row.get("name", "")).strip()
+            aug_name = str(row.get("name", "")).strip() or str(aug_meta.get("name", "")).strip()
+            icon_url = str(row.get("icon_url", "")).strip() or str(aug_meta.get("icon_url", "")).strip()
+            rarity = str(row.get("rarity", "")).strip() or str(aug_meta.get("rarity", "")).strip()
 
             recos.append(
                 {
-                    "augment_id": str(row.get("augment_id", "")).strip(),
+                    "augment_id": augment_id,
                     "name": aug_name,
+                    "icon_url": icon_url,
+                    "rarity": rarity,
                     "tier": website_tier,
                     "tier_label": website_tier,
                     "grade": "S",
@@ -1269,9 +1410,15 @@ class SourceHextechProvider(app.ApexHextechProvider):
                 "date": stat_row.get("date"),
                 "combo_reco": [
                     {
-                        "name": _format_combo_token(row.get("combo_token", "")),
+                        "name": " + ".join(
+                            [
+                                str(member.get("name", "")).strip()
+                                for member in _build_combo_members(row.get("combo_token", ""))
+                                if str(member.get("name", "")).strip()
+                            ]
+                        ) or _format_combo_token(row.get("combo_token", "")),
                         "rating": str(row.get("tier_label") or "").strip().upper(),
-                        "members": [],
+                        "members": _build_combo_members(row.get("combo_token", "")),
                         "website_rank": row.get("website_rank"),
                     }
                     for row in combo_rows[:10]
@@ -1302,7 +1449,7 @@ def configure_provider():
     augment_index_path = os.path.join(base_dir, "hextech_augment_index.json")
 
     # Force a one-time refresh after parser/source fixes.
-    app.HEXTECH_PARSE_SCHEMA_VERSION = max(int(getattr(app, "HEXTECH_PARSE_SCHEMA_VERSION", 0) or 0), 8)
+    app.HEXTECH_PARSE_SCHEMA_VERSION = max(int(getattr(app, "HEXTECH_PARSE_SCHEMA_VERSION", 0) or 0), 9)
 
     app.HEXTECH_CACHE_PATH = cache_path
     app.HEXTECH_AUGMENT_INDEX_PATH = augment_index_path
@@ -1316,5 +1463,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

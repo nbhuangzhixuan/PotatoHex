@@ -10,6 +10,7 @@ PotatoHex - 简化版
 import os
 import sys
 import time
+import io
 import re
 import json
 import html
@@ -20,11 +21,12 @@ import traceback
 import tempfile
 import difflib
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk
 from ctypes import wintypes
 import cv2
 import numpy as np
-from PIL import ImageGrab
+from PIL import Image, ImageGrab, ImageTk
 import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -94,6 +96,11 @@ LCU_PROCESS_NAMES = {
     "leagueclient.exe",
     "leagueclientuxrender.exe",
 }
+GAME_PROCESS_NAMES = {
+    "league of legends.exe",
+    "league of legends(tm) client.exe",
+    "league of legends tm client.exe",
+}
 
 HEXTECH_CACHE_FILE_NAME = "hextech_reco_cache.json"
 HEXTECH_AUGMENT_INDEX_FILE_NAME = "hextech_augment_index.json"
@@ -118,11 +125,17 @@ HEXTECH_ROI_DETECT_MIN_HITS = 2
 HEXTECH_ROI_TEXT_SCORE_THRESHOLD = 6.2
 HEXTECH_OCR_TEXT_STICKY_SECONDS = 2.8
 HEXTECH_MAIN_LOOP_INTERVAL = 1.5
+HEXTECH_IN_GAME_MAIN_LOOP_INTERVAL = 0.8
+HEXTECH_HOTKEY_POLL_INTERVAL = 0.03
 HEXTECH_ACTIVE_LOOP_INTERVAL = 0.4
 HEXTECH_ACTIVE_OCR_REFRESH_INTERVAL = 0.5
 HEXTECH_CLOSE_GRACE_SECONDS = 1.2
 HEXTECH_CLOSE_MISS_LIMIT = 2
 HEXTECH_PARSE_SCHEMA_VERSION = 3
+HEXTECH_MANUAL_TRIGGER_VKS = (0xDC, 0xE2)
+HEXTECH_MANUAL_TRIGGER_SCANCODES = (0x2B, 0x56)
+HEXTECH_MANUAL_TRIGGER_NAME = "\\ 键"
+HEXTECH_MANUAL_TRIGGER_COOLDOWN = 0.8
 # OCR ROI tuning ratios (relative to full screenshot)
 HEXTECH_CARD_PANEL_X1_RATIO = 0.04
 HEXTECH_CARD_PANEL_X2_RATIO = 0.96
@@ -204,6 +217,65 @@ def is_aug_name_like(text):
 
 def contains_cjk(text):
     return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def is_virtual_key_down(vk_code):
+    if os.name != "nt":
+        return False
+    try:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(int(vk_code)) & 0x8000)
+    except Exception:
+        return False
+
+
+def is_any_virtual_key_down(vk_codes):
+    for vk_code in vk_codes or []:
+        if is_virtual_key_down(vk_code):
+            return True
+    return False
+
+
+if os.name == "nt" and not hasattr(wintypes, "ULONG_PTR"):
+    wintypes.ULONG_PTR = wintypes.WPARAM
+if os.name == "nt" and not hasattr(wintypes, "LRESULT"):
+    wintypes.LRESULT = ctypes.c_ssize_t
+
+
+HEXTECH_MANUAL_TRIGGER_VK_SET = set(int(v) for v in HEXTECH_MANUAL_TRIGGER_VKS)
+HEXTECH_MANUAL_TRIGGER_SCANCODE_SET = set(int(v) for v in HEXTECH_MANUAL_TRIGGER_SCANCODES)
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", wintypes.ULONG_PTR),
+    ]
+
+
+def is_manual_trigger_key(vk_code=None, scan_code=None):
+    try:
+        if vk_code is not None and int(vk_code) in HEXTECH_MANUAL_TRIGGER_VK_SET:
+            return True
+    except Exception:
+        pass
+    try:
+        if scan_code is not None and int(scan_code) in HEXTECH_MANUAL_TRIGGER_SCANCODE_SET:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def is_running_as_admin():
+    if os.name != "nt":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
 
 def is_likely_augment_name(text):
@@ -389,7 +461,7 @@ def build_items_for_row(base_row, all_rows, max_count=4):
     return result[:max_count]
 
 
-def build_scrollable_combo_box(parent, bg, accent, title_text):
+def build_scrollable_combo_box(parent, bg, accent, title_text, side="top"):
     outer = tk.Frame(
         parent,
         bg=bg,
@@ -398,7 +470,7 @@ def build_scrollable_combo_box(parent, bg, accent, title_text):
         padx=8,
         pady=6,
     )
-    outer.pack(fill="both", expand=True, pady=(0, 6), padx=8)
+    outer.pack(side=side, fill="x", expand=False, pady=(0, 6), padx=8)
     outer.pack_propagate(False)
 
     tk.Label(
@@ -415,20 +487,34 @@ def build_scrollable_combo_box(parent, bg, accent, title_text):
     canvas = tk.Canvas(body, bg=bg, highlightthickness=0, bd=0)
     scrollbar = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
     canvas.configure(yscrollcommand=scrollbar.set)
-    scrollbar.pack(side="right", fill="y")
     canvas.pack(side="left", fill="both", expand=True)
     inner = tk.Frame(canvas, bg=bg)
     window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
 
+    def _sync_scrollbar_visibility():
+        try:
+            bbox = canvas.bbox("all")
+            content_height = (bbox[3] - bbox[1]) if bbox else 0
+            viewport_height = max(1, int(canvas.winfo_height() or 0))
+            needs_scroll = content_height > (viewport_height + 2)
+            if needs_scroll and not scrollbar.winfo_ismapped():
+                scrollbar.pack(side="right", fill="y")
+            elif (not needs_scroll) and scrollbar.winfo_ismapped():
+                scrollbar.pack_forget()
+        except Exception:
+            pass
+
     def _sync_region(_event=None):
         try:
             canvas.configure(scrollregion=canvas.bbox("all"))
+            _sync_scrollbar_visibility()
         except Exception:
             pass
 
     def _sync_width(event):
         try:
             canvas.itemconfigure(window_id, width=event.width)
+            canvas.after_idle(_sync_scrollbar_visibility)
         except Exception:
             pass
 
@@ -1309,6 +1395,13 @@ def setup_logging():
     sys.stderr = TeeStream(sys.__stderr__, _LOG_FILE_HANDLE)
 
 
+def hotkey_log(message):
+    text = str(message or "").strip()
+    if not text:
+        return
+    print(text)
+
+
 class QuietStream:
     def __init__(self, stream, allow_prefixes):
         self.stream = stream
@@ -1335,6 +1428,8 @@ class QuietStream:
         if line.startswith("[Startup]"):
             return True
         if line.startswith("[Log]"):
+            return True
+        if line.startswith("[Hotkey]"):
             return True
         if line.startswith("[Error]") or line.startswith("[Fatal]"):
             return True
@@ -1830,11 +1925,32 @@ def load_champion_map(port, token):
         traceback.print_exc()
 
 
-def get_champ_select_state():
-    """查询选人会话状态，返回 (active, champion_name_or_none)。"""
+def _champion_name_from_id(champ_id, include_alias=True):
+    if not champ_id:
+        return None
+    info = _champion_map.get(champ_id)
+    if isinstance(info, dict):
+        name = info.get("name") or f"未知(ID:{champ_id})"
+        alias = (info.get("alias") or "").strip()
+        if include_alias and alias:
+            return f"{name}|{alias}"
+        return name
+    if isinstance(info, str):
+        return info
+    return f"ID:{champ_id}"
+
+
+def get_champ_select_details():
+    """查询选人会话状态，返回当前英雄与待选英雄列表。"""
     port, token = _cached_credentials if _cached_credentials[0] else get_lcu_credentials()
+    details = {
+        "active": False,
+        "current_champion": None,
+        "bench_champions": [],
+        "candidate_champions": [],
+    }
     if not port:
-        return False, None
+        return details
     try:
         url = f"https://127.0.0.1:{port}/lol-champ-select/v1/session"
         resp = requests.get(url, auth=('riot', token), verify=False, timeout=3)
@@ -1844,7 +1960,7 @@ def get_champ_select_state():
                 f"[LCU] 选人会话接口返回 HTTP {resp.status_code}, body={response_snippet(resp)}",
                 interval=10,
             )
-            return False, None
+            return details
         session = resp.json()
         my_cell_id = session.get('localPlayerCellId', -1)
         team = session.get('myTeam', [])
@@ -1853,32 +1969,57 @@ def get_champ_select_state():
             f"[LCU] 已连接选人会话: localPlayerCellId={my_cell_id}, team_size={len(team)}",
             interval=15,
         )
+        details["active"] = True
+
         for actor in team:
-            if actor['cellId'] == my_cell_id:
-                # championId: 已锁定；championPickIntent: 正在悬停
+            if actor.get('cellId') == my_cell_id:
                 champ_id = actor.get('championId') or actor.get('championPickIntent', 0)
                 if champ_id:
-                    if _champion_map:
-                        info = _champion_map.get(champ_id)
-                        if isinstance(info, dict):
-                            name = info.get("name") or f"未知(ID:{champ_id})"
-                            alias = (info.get("alias") or "").strip()
-                            if alias:
-                                return True, f"{name}|{alias}"
-                            return True, name
-                        if isinstance(info, str):
-                            return True, info
-                        return True, f"未知(ID:{champ_id})"
-                    return True, f"ID:{champ_id}"
-                log_status("champ_select_empty", "[LCU] 已进入选人，但当前还没有悬停/锁定英雄", interval=10)
-                return True, None
-        return True, None
+                    details["current_champion"] = _champion_name_from_id(champ_id, include_alias=True)
+                break
+
+        bench_list = []
+        for item in (session.get("benchChampions") or []):
+            champ_id = 0
+            if isinstance(item, dict):
+                champ_id = item.get("championId") or 0
+            elif isinstance(item, int):
+                champ_id = item
+            if not champ_id:
+                continue
+            bench_name = _champion_name_from_id(champ_id, include_alias=True)
+            if bench_name:
+                bench_list.append(bench_name)
+        details["bench_champions"] = bench_list
+
+        candidates = []
+        seen = set()
+        for raw in [details["current_champion"], *bench_list]:
+            if not raw:
+                continue
+            label = str(raw).split("|", 1)[0].strip()
+            key = normalize_name_key(label or raw)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            candidates.append(raw)
+        details["candidate_champions"] = candidates
+
+        if not details["current_champion"]:
+            log_status("champ_select_empty", "[LCU] 已进入选人，但当前还没有悬停/锁定英雄", interval=10)
+        return details
     except requests.exceptions.ConnectionError:
         log_status("champ_select_conn", f"[LCU] 无法连接选人接口: https://127.0.0.1:{port}/lol-champ-select/v1/session", interval=10)
     except Exception as e:
         print(f"[LCU] 查询失败: {e}")
         traceback.print_exc()
-    return False, None
+    return details
+
+
+def get_champ_select_state():
+    """查询选人会话状态，返回 (active, champion_name_or_none)。"""
+    details = get_champ_select_details()
+    return bool(details.get("active")), details.get("current_champion")
 
 
 def get_my_selected_champion():
@@ -1904,7 +2045,7 @@ def is_league_client_running():
 
 
 def is_game_running():
-    """检查游戏是否在运行（通过检测 League of Legends.exe 进程）"""
+    """检查游戏是否在运行（兼容不同发行包的游戏进程名）"""
     try:
         result = subprocess.run(
             ['tasklist'],
@@ -1913,7 +2054,8 @@ def is_game_running():
             timeout=5
             , **_hidden_subprocess_kwargs()
         )
-        return 'League of Legends.exe' in result.stdout
+        output = str(result.stdout or "").lower()
+        return any(name in output for name in GAME_PROCESS_NAMES)
     except Exception:
         return False
 
@@ -2278,6 +2420,15 @@ def _is_meaningful_chinese_text(text, min_cjk=2):
     return len(re.findall(r"[\u4e00-\u9fff]", t)) >= int(min_cjk or 2)
 
 
+def _is_valid_hextech_probe_hit(text, score, min_cjk=2):
+    if not _is_meaningful_chinese_text(text, min_cjk=min_cjk):
+        return False
+    try:
+        return float(score or 0.0) >= float(HEXTECH_ROI_TEXT_SCORE_THRESHOLD)
+    except Exception:
+        return False
+
+
 def _cleanup_ocr_binary(bw):
     h, w = bw.shape[:2]
     side = int(w * 0.10)
@@ -2413,7 +2564,7 @@ def probe_hextech_screen_by_left_card(screenshot):
 def probe_hextech_screen_by_left_and_middle_cards(screenshot):
     """
     Strong probe for the hextech page.
-    All three cards must contain meaningful Chinese text.
+    Any two cards with stable Chinese OCR are enough to confirm the page.
     Returns (ok, left_text, middle_text, right_text, rois, roi_boxes, debug_dict).
     """
     if screenshot is None:
@@ -2421,75 +2572,52 @@ def probe_hextech_screen_by_left_and_middle_cards(screenshot):
         return False, "", "", "", [], [], {"score": -1, "candidate": "", "reason": "screenshot_none"}
     try:
         rois, roi_boxes = _extract_three_card_name_rois(screenshot)
-        if len(rois) < 3:
+        min_hits = max(1, int(HEXTECH_ROI_DETECT_MIN_HITS or 2))
+        if len(rois) < min_hits:
             print("[Debug] ROI-only 检测失败: 有效卡片ROI不足")
             return False, "", "", "", [], [], {"score": -1, "candidate": "", "reason": "insufficient_rois"}
+        texts = ["", "", ""]
+        scores = [-1.0, -1.0, -1.0]
+        ok_flags = [False, False, False]
+        candidates = ["", "", ""]
+        labels = ("left_probe", "middle_probe", "right_probe")
+        for idx in range(min(3, len(rois))):
+            text, info = _ocr_best_text_from_card_roi(rois[idx], label=labels[idx])
+            score = float(info.get("score", -1) or -1)
+            texts[idx] = text
+            scores[idx] = score
+            candidates[idx] = str(info.get("candidate", "") or "")
+            ok_flags[idx] = _is_valid_hextech_probe_hit(text, score, min_cjk=2)
 
-        left_text, left_debug = _ocr_best_text_from_card_roi(rois[0], label="left_probe")
-        left_score = float(left_debug.get("score", -1) or -1)
-        left_ok = _is_meaningful_chinese_text(left_text, min_cjk=2)
-        if not left_ok:
-            log_status(
-                "hextech_left_probe_state",
-                f"[Debug] 左卡探测: ok=False, score={left_score:.1f}, "
-                f"candidate={left_debug.get('candidate')}, text={left_text}",
-                interval=5,
-            )
-            left_debug = dict(left_debug)
-            left_debug["text"] = left_text
-            left_debug["ok"] = False
-            left_debug["middle_text"] = ""
-            left_debug["middle_ok"] = False
-            left_debug["right_text"] = ""
-            left_debug["right_ok"] = False
-            left_debug["roi_box"] = roi_boxes[0] if roi_boxes else None
-            return False, left_text, "", "", rois, roi_boxes, left_debug
-
-        middle_text, middle_debug = _ocr_best_text_from_card_roi(rois[1], label="middle_probe")
-        middle_score = float(middle_debug.get("score", -1) or -1)
-        middle_ok = _is_meaningful_chinese_text(middle_text, min_cjk=2)
-        if not middle_ok:
-            log_status(
-                "hextech_middle_probe_state",
-                f"[Debug] 中卡探测: ok=False, score={middle_score:.1f}, "
-                f"candidate={middle_debug.get('candidate')}, text={middle_text}",
-                interval=5,
-            )
-            debug = dict(left_debug)
-            debug["text"] = left_text
-            debug["ok"] = False
-            debug["middle_text"] = middle_text
-            debug["middle_ok"] = False
-            debug["right_text"] = ""
-            debug["right_ok"] = False
-            debug["middle_score"] = middle_score
-            debug["middle_candidate"] = middle_debug.get("candidate", "")
-            debug["roi_box"] = roi_boxes[0] if roi_boxes else None
-            debug["middle_roi_box"] = roi_boxes[1] if len(roi_boxes) > 1 else None
-            return False, left_text, middle_text, "", rois, roi_boxes, debug
-
-        right_text, right_debug = _ocr_best_text_from_card_roi(rois[2], label="right_probe")
-        right_score = float(right_debug.get("score", -1) or -1)
-        right_ok = _is_meaningful_chinese_text(right_text, min_cjk=2)
-        ok = left_ok and middle_ok and right_ok
+        hit_count = sum(1 for flag in ok_flags if flag)
+        left_text, middle_text, right_text = texts
+        left_score, middle_score, right_score = scores
+        left_ok, middle_ok, right_ok = ok_flags
+        ok = hit_count >= min_hits
         log_status(
             "hextech_three_probe_state",
-            f"[Debug] 三卡探测: ok={ok}, left_score={left_score:.1f}, middle_score={middle_score:.1f}, right_score={right_score:.1f}, "
-            f"left_candidate={left_debug.get('candidate')}, middle_candidate={middle_debug.get('candidate')}, right_candidate={right_debug.get('candidate')}, "
+            f"[Debug] 三卡探测: ok={ok}, hits={hit_count}/{min_hits}, left_ok={left_ok}, middle_ok={middle_ok}, right_ok={right_ok}, "
+            f"left_score={left_score:.1f}, middle_score={middle_score:.1f}, right_score={right_score:.1f}, "
+            f"left_candidate={candidates[0]}, middle_candidate={candidates[1]}, right_candidate={candidates[2]}, "
             f"left_text={left_text}, middle_text={middle_text}, right_text={right_text}",
             interval=5,
         )
-        debug = dict(left_debug)
+        debug = {
+            "score": left_score,
+            "candidate": candidates[0],
+        }
         debug["text"] = left_text
         debug["ok"] = ok
+        debug["hit_count"] = hit_count
+        debug["min_hits"] = min_hits
         debug["middle_text"] = middle_text
         debug["middle_ok"] = middle_ok
         debug["right_text"] = right_text
         debug["right_ok"] = right_ok
         debug["middle_score"] = middle_score
-        debug["middle_candidate"] = middle_debug.get("candidate", "")
+        debug["middle_candidate"] = candidates[1]
         debug["right_score"] = right_score
-        debug["right_candidate"] = right_debug.get("candidate", "")
+        debug["right_candidate"] = candidates[2]
         debug["roi_box"] = roi_boxes[0] if roi_boxes else None
         debug["middle_roi_box"] = roi_boxes[1] if len(roi_boxes) > 1 else None
         debug["right_roi_box"] = roi_boxes[2] if len(roi_boxes) > 2 else None
@@ -2730,6 +2858,8 @@ def detect_hextech_offers_by_ocr(screenshot, champion_recos, champion_name=None,
                 "index": i + 1,
                 "name": display_name,
                 "matched_name": matched_name,
+                "icon_url": str((best_item or {}).get("icon_url", "")).strip() if matched else "",
+                "rarity": str((best_item or {}).get("rarity", "")).strip() if matched else "",
                 "grade_label": grade_label,
                 "tier_label": tier_label,
                 "win_rate": win_rate,
@@ -2764,12 +2894,20 @@ class HextechOverlay:
         self.preview_visible = False
         self._lock = threading.Lock()
         self._last_show_signature = None
+        self._last_preview_show_signature = None
         self.preview_canvas = None
         self.preview_scrollbar = None
         self.preview_inner_frame = None
         self._active_champion_name = None
+        self._icon_cache = {}
+        self._icon_failed = set()
+        self._icon_pending = {}
+        self._icon_loading = set()
+        self._overlay_width = 680
+        self._main_content_height = 360
+        self._preview_content_height = 600
 
-    def _build_show_signature(self, hextech_list, champion_name):
+    def _build_show_signature(self, hextech_list, champion_name, loading=False, empty_title="", empty_subtitle=""):
         try:
             rows = []
             for row in (hextech_list or [])[:3]:
@@ -2777,6 +2915,8 @@ class HextechOverlay:
                     continue
                 rows.append((
                     str(row.get("name", "")).strip(),
+                    str(row.get("icon_url", "")).strip(),
+                    str(row.get("rarity", "")).strip().lower(),
                     str(row.get("tier_label") or row.get("tier") or "").strip().upper(),
                     str(row.get("grade", "")).strip().upper(),
                     str(row.get("tags", "")).strip(),
@@ -2784,9 +2924,44 @@ class HextechOverlay:
                     str(row.get("combo_text", "")).strip(),
                     str(row.get("items_text", "")).strip(),
                 ))
-            return (str(champion_name or "").strip(), tuple(rows))
+            return (
+                str(champion_name or "").strip(),
+                bool(loading),
+                str(empty_title or "").strip(),
+                str(empty_subtitle or "").strip(),
+                tuple(rows),
+                self._build_combo_signature(champion_name),
+            )
         except Exception:
             return (str(champion_name or "").strip(), ())
+
+    def _build_combo_signature(self, champion_name):
+        try:
+            combos = self._get_combo_recommendations_for_champion(champion_name)
+            packed = []
+            for item in combos or []:
+                if not isinstance(item, dict):
+                    continue
+                members = item.get("members") if isinstance(item.get("members"), list) else []
+                packed.append(
+                    (
+                        str(item.get("name", "")).strip(),
+                        str(item.get("rating", "")).strip().upper(),
+                        tuple(
+                            (
+                                str(member.get("augment_id", "")).strip(),
+                                str(member.get("name", "")).strip(),
+                                str(member.get("icon_url", "")).strip(),
+                                str(member.get("rarity", "")).strip().lower(),
+                            )
+                            for member in members
+                            if isinstance(member, dict)
+                        ),
+                    )
+                )
+            return tuple(packed)
+        except Exception:
+            return ()
 
     @staticmethod
     def _grade_label_and_style(grade_raw):
@@ -2843,6 +3018,207 @@ class HextechOverlay:
             return "#c0c0c0"
         return "#ecf5ff"
 
+    @staticmethod
+    def _normalize_rarity_style(rarity_raw):
+        r = str(rarity_raw or "").strip().lower()
+        if "棱彩" in r or "prismatic" in r:
+            return "prismatic"
+        if "黄金" in r or "gold" in r:
+            return "gold"
+        if "白银" in r or "silver" in r:
+            return "silver"
+        return ""
+
+    @classmethod
+    def _rarity_icon_style(cls, rarity_raw):
+        style = cls._normalize_rarity_style(rarity_raw)
+        if style == "prismatic":
+            return {"border": "#b366ff", "bg": "#1e1530", "fg": "#ddb7ff"}
+        if style == "gold":
+            return {"border": "#c29c6d", "bg": "#2e2518", "fg": "#f1d7a6"}
+        if style == "silver":
+            return {"border": "#5a5a5a", "bg": "#2a2a3a", "fg": "#d7d7df"}
+        return {"border": "#274870", "bg": "#1a1a2e", "fg": "#7f9bc4"}
+
+    def _combo_member_font(self):
+        try:
+            return tkfont.Font(font=("Microsoft YaHei", 11, "bold"))
+        except Exception:
+            return None
+
+    def _estimate_combo_chip_width(self, text, icon_size=30):
+        text = str(text or "").strip()
+        font_obj = self._combo_member_font()
+        try:
+            text_width = font_obj.measure(text) if font_obj is not None else 0
+        except Exception:
+            text_width = 0
+        if text_width <= 0:
+            text_width = max(56, len(text) * 18)
+        text_block_width = max(72, text_width)
+        return icon_size + text_block_width + 32
+
+    @staticmethod
+    def _estimate_combo_panel_height(combos):
+        combo_count = len([item for item in (combos or []) if isinstance(item, dict)])
+        if combo_count <= 0:
+            return 84
+        return 560
+
+    def _sync_combo_container_heights(self, combos):
+        height = self._estimate_combo_panel_height(combos)
+        for widget in (getattr(self, "combo_container", None), getattr(self, "preview_combo_container", None)):
+            if widget is None:
+                continue
+            try:
+                widget.configure(height=height)
+            except Exception:
+                pass
+        self._resize_main_window()
+        self._resize_preview_window()
+
+    def _resize_window(self, window, width, anchor_fn=None):
+        if window is None:
+            return
+        try:
+            window.update_idletasks()
+            height = max(1, int(window.winfo_reqheight() or 0))
+            x = int(window.winfo_x() or 0)
+            y = int(window.winfo_y() or 0)
+            if x > 0 or y > 0:
+                window.geometry(f"{width}x{height}+{x}+{y}")
+            else:
+                window.geometry(f"{width}x{height}")
+                if anchor_fn is not None:
+                    anchor_fn()
+        except Exception:
+            pass
+
+    def _resize_main_window(self):
+        self._resize_window(self.root, self._overlay_width, anchor_fn=self._anchor_top_right)
+
+    def _resize_preview_window(self):
+        self._resize_window(self.preview_root, self._overlay_width, anchor_fn=self._anchor_preview_top_right)
+
+    def _set_icon_label_photo(self, label, photo):
+        if label is None:
+            return
+        try:
+            if not label.winfo_exists():
+                return
+            if photo is not None:
+                label.configure(image=photo, text="")
+                label.image = photo
+            else:
+                label.configure(image="", text="?", fg="#7f9bc4")
+                label.image = None
+        except Exception:
+            pass
+
+    def _icon_cache_key(self, icon_url, size):
+        return (str(icon_url or "").strip(), int(size or 36))
+
+    def _load_icon_worker(self, key):
+        icon_url, size = key
+        payload = None
+        try:
+            resp = requests.get(
+                icon_url,
+                headers={"User-Agent": "hextech-assistant/1.0"},
+                timeout=6,
+            )
+            if resp.status_code == 200 and resp.content:
+                payload = resp.content
+        except Exception:
+            payload = None
+
+        root = self.root or self.preview_root
+        if root is None:
+            with self._lock:
+                self._icon_loading.discard(key)
+                self._icon_pending.pop(key, None)
+                self._icon_failed.add(key)
+            return
+
+        def _finish():
+            photo = None
+            if payload:
+                try:
+                    img = Image.open(io.BytesIO(payload)).convert("RGBA")
+                    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+                    img = img.resize((size, size), resampling)
+                    photo = ImageTk.PhotoImage(img)
+                except Exception:
+                    photo = None
+
+            with self._lock:
+                waiters = list(self._icon_pending.pop(key, []))
+                self._icon_loading.discard(key)
+                if photo is not None:
+                    self._icon_cache[key] = photo
+                    self._icon_failed.discard(key)
+                else:
+                    self._icon_failed.add(key)
+
+            for label in waiters:
+                self._set_icon_label_photo(label, photo)
+
+        try:
+            root.after(0, _finish)
+        except Exception:
+            with self._lock:
+                self._icon_loading.discard(key)
+                self._icon_pending.pop(key, None)
+                self._icon_failed.add(key)
+
+    def _bind_icon_label(self, label, icon_url, size=38):
+        key = self._icon_cache_key(icon_url, size)
+        if not key[0]:
+            self._set_icon_label_photo(label, None)
+            return
+
+        cached_photo = None
+        should_start_worker = False
+        with self._lock:
+            cached_photo = self._icon_cache.get(key)
+            if cached_photo is None and key not in self._icon_failed:
+                self._icon_pending.setdefault(key, []).append(label)
+                if key not in self._icon_loading:
+                    self._icon_loading.add(key)
+                    should_start_worker = True
+
+        if cached_photo is not None:
+            self._set_icon_label_photo(label, cached_photo)
+            return
+        if key in self._icon_failed:
+            self._set_icon_label_photo(label, None)
+            return
+        if should_start_worker:
+            threading.Thread(target=self._load_icon_worker, args=(key,), daemon=True).start()
+
+    def _make_augment_icon(self, parent, icon_url, rarity=None, bg="#14213d", size=38, padx=(0, 8)):
+        style = self._rarity_icon_style(rarity)
+        holder = tk.Frame(
+            parent,
+            bg=style["bg"],
+            width=size,
+            height=size,
+            highlightbackground=style["border"],
+            highlightthickness=2,
+        )
+        holder.pack(side="left", padx=padx, anchor="n")
+        holder.pack_propagate(False)
+        label = tk.Label(
+            holder,
+            text="?",
+            bg=style["bg"],
+            fg=style["fg"],
+            font=("Microsoft YaHei", 9, "bold"),
+        )
+        label.pack(fill="both", expand=True)
+        self._bind_icon_label(label, icon_url, size=size)
+        return holder
+
     def _pin_window_topmost(self):
         """Use Win32 styles to keep overlay above normal/borderless game windows."""
         if os.name != "nt" or self.root is None:
@@ -2870,7 +3246,7 @@ class HextechOverlay:
                 hwnd,
                 HWND_TOPMOST,
                 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
             )
         except Exception as e:
             log_status("overlay_topmost_error", f"[Overlay] 置顶样式设置失败: {e}", interval=20)
@@ -2880,10 +3256,10 @@ class HextechOverlay:
             if self.preview_root is None:
                 return
         try:
-            if self.root is not None:
+            if self.root is not None and self.visible:
                 self.root.attributes("-topmost", True)
                 self._pin_window_topmost()
-            if self.preview_root is not None:
+            if self.preview_root is not None and self.preview_visible:
                 self.preview_root.attributes("-topmost", True)
             if self.root is not None:
                 self.root.after(1000, self._topmost_keepalive)
@@ -2940,21 +3316,22 @@ class HextechOverlay:
             command=self.hide
         ).pack(side="right", padx=6)
 
-        # 列表区域
-        self.list_frame = tk.Frame(panel, bg="#10192f", padx=8, pady=6)
-        self.list_frame.pack(fill="both", expand=True)
-
         self.combo_container, self.combo_frame = build_scrollable_combo_box(
             panel,
             bg="#0c1430",
             accent="#2b6b9e",
             title_text="推荐海克斯组合",
+            side="bottom",
         )
-        self.combo_container.configure(height=360)
+        self.combo_container.configure(height=self._estimate_combo_panel_height([]))
+
+        # 列表区域
+        self.list_frame = tk.Frame(panel, bg="#10192f", padx=8, pady=6, height=self._main_content_height)
+        self.list_frame.pack(fill="x", expand=False)
+        self.list_frame.pack_propagate(False)
 
         # 初始位置：右上角
-        self.root.geometry("680x920")
-        self._anchor_top_right()
+        self._resize_main_window()
 
         self.root.withdraw()  # 初始隐藏
         self._pin_window_topmost()
@@ -2996,8 +3373,29 @@ class HextechOverlay:
             command=self.hide_preview
         ).pack(side="right", padx=6)
 
-        body = tk.Frame(p_panel, bg="#10192f")
-        body.pack(fill="both", expand=True)
+        tk.Label(
+            p_panel,
+            text=f"游戏内海克斯页面按{HEXTECH_MANUAL_TRIGGER_NAME}可打开/关闭识别悬浮窗",
+            bg="#10192f",
+            fg="#7ecfff",
+            font=("Microsoft YaHei", 9, "bold"),
+            anchor="w",
+            padx=8,
+            pady=6,
+        ).pack(fill="x")
+
+        self.preview_combo_container, self.preview_combo_frame = build_scrollable_combo_box(
+            p_panel,
+            bg="#0c1430",
+            accent="#2b6b9e",
+            title_text="推荐海克斯组合",
+            side="bottom",
+        )
+        self.preview_combo_container.configure(height=self._estimate_combo_panel_height([]))
+
+        body = tk.Frame(p_panel, bg="#10192f", height=self._preview_content_height)
+        body.pack(fill="x", expand=False)
+        body.pack_propagate(False)
         self.preview_canvas = tk.Canvas(body, bg="#10192f", highlightthickness=0, bd=0)
         self.preview_scrollbar = ttk.Scrollbar(body, orient="vertical", command=self.preview_canvas.yview)
         self.preview_canvas.configure(yscrollcommand=self.preview_scrollbar.set)
@@ -3018,16 +3416,7 @@ class HextechOverlay:
             widget.bind("<Button-4>", self._on_preview_mousewheel, add="+")
             widget.bind("<Button-5>", self._on_preview_mousewheel, add="+")
 
-        self.preview_combo_container, self.preview_combo_frame = build_scrollable_combo_box(
-            p_panel,
-            bg="#0c1430",
-            accent="#2b6b9e",
-            title_text="推荐海克斯组合",
-        )
-        self.preview_combo_container.configure(height=360)
-
-        self.preview_root.geometry("680x920")
-        self._anchor_preview_top_right()
+        self._resize_preview_window()
         self.preview_root.withdraw()
         self.root.mainloop()
 
@@ -3114,6 +3503,142 @@ class HextechOverlay:
             pass
         return []
 
+    def _get_candidate_strength_rows(self, candidate_champions):
+        provider = globals().get("hextech_provider")
+        if provider is None or not candidate_champions:
+            return []
+        try:
+            if hasattr(provider, "get_champion_strengths"):
+                rows = provider.get_champion_strengths(candidate_champions)
+                if isinstance(rows, list):
+                    return [dict(x) for x in rows if isinstance(x, dict)]
+        except Exception:
+            pass
+        return []
+
+    @staticmethod
+    def _build_candidate_strength_signature(candidate_rows):
+        packed = []
+        for row in candidate_rows or []:
+            if not isinstance(row, dict):
+                continue
+            packed.append(
+                (
+                    str(row.get("name", "")).strip(),
+                    str(row.get("tier_label", "")).strip().upper(),
+                    row.get("win_rate"),
+                    row.get("pick_rate"),
+                    str(row.get("champion_id", "")).strip(),
+                )
+            )
+        return tuple(packed)
+
+    def _render_candidate_strengths(self, container, candidate_rows):
+        if container is None:
+            return
+        section = tk.Frame(
+            container,
+            bg="#0c1430",
+            highlightbackground="#2b6b9e",
+            highlightthickness=1,
+            padx=10,
+            pady=8,
+        )
+        section.pack(fill="x", pady=(0, 8))
+
+        tk.Label(
+            section,
+            text="待选英雄强度",
+            bg="#0c1430",
+            fg="#98f7ff",
+            font=("Microsoft YaHei", 10, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+
+        if not candidate_rows:
+            tk.Label(
+                section,
+                text="等待待选英雄列表...",
+                bg="#0c1430",
+                fg="#7f9bc4",
+                font=("Microsoft YaHei", 9),
+                anchor="w",
+            ).pack(fill="x", pady=(4, 0))
+            return
+
+        chips_host = tk.Frame(section, bg="#0c1430")
+        chips_host.pack(fill="x", pady=(6, 0))
+        try:
+            chips_host.update_idletasks()
+            available_width = max(240, int(chips_host.winfo_width() or container.winfo_width() or 620))
+        except Exception:
+            available_width = 620
+        chip_width = 194
+        per_row = max(1, available_width // (chip_width + 8))
+        current_line = None
+
+        for idx, row in enumerate(candidate_rows):
+            if idx % per_row == 0:
+                current_line = tk.Frame(chips_host, bg="#0c1430")
+                current_line.pack(fill="x", anchor="w")
+
+            tier = str(row.get("tier_label", "")).strip().upper()
+            badge_show, badge_bg, badge_fg = self._tier_badge_style(tier if tier in {"T1", "T2", "T3", "T4", "T5"} else "")
+            if tier not in {"T1", "T2", "T3", "T4", "T5"}:
+                badge_show = "无评级"
+            name_fg = self._tier_name_color(tier)
+            border_color = badge_bg if tier in {"T1", "T2", "T3", "T4", "T5"} else "#234c7f"
+
+            chip = tk.Frame(
+                current_line,
+                bg="#14213d",
+                highlightbackground=border_color,
+                highlightthickness=1,
+                width=chip_width,
+                height=62,
+                padx=8,
+                pady=6,
+            )
+            chip.pack(side="left", padx=(0, 8), pady=(0, 8))
+            chip.pack_propagate(False)
+
+            top_row = tk.Frame(chip, bg="#14213d")
+            top_row.pack(fill="x")
+            tk.Label(
+                top_row,
+                text=str(row.get("name", "")).strip() or "未知英雄",
+                bg="#14213d",
+                fg=name_fg,
+                font=("Microsoft YaHei", 10, "bold"),
+                anchor="w",
+            ).pack(side="left", fill="x", expand=True)
+            tk.Label(
+                top_row,
+                text=badge_show,
+                bg=badge_bg,
+                fg=badge_fg,
+                font=("Microsoft YaHei", 8, "bold"),
+                padx=6,
+                pady=2,
+            ).pack(side="right")
+
+            wr = row.get("win_rate")
+            pr = row.get("pick_rate")
+            stat_parts = []
+            if wr is not None:
+                stat_parts.append(f"胜率 {float(wr):.2f}%")
+            if pr is not None:
+                stat_parts.append(f"登场 {float(pr):.2f}%")
+            stat_text = "  ".join(stat_parts) if stat_parts else "暂无评级数据"
+            tk.Label(
+                chip,
+                text=stat_text,
+                bg="#14213d",
+                fg="#b7cdf4" if stat_parts else "#7f9bc4",
+                font=("Microsoft YaHei", 9, "bold" if stat_parts else "normal"),
+                anchor="w",
+            ).pack(fill="x", pady=(6, 0))
+
     def _render_combo_recommendations(self, container, champion_name, title_text="推荐海克斯组合"):
         if container is None:
             return
@@ -3121,6 +3646,7 @@ class HextechOverlay:
             widget.destroy()
 
         combos = self._get_combo_recommendations_for_champion(champion_name)
+        self._sync_combo_container_heights(combos)
         if not combos:
             tk.Label(
                 container,
@@ -3137,6 +3663,8 @@ class HextechOverlay:
             if not name:
                 continue
             rating = str(item.get("rating", "")).strip()
+            members = item.get("members") if isinstance(item.get("members"), list) else []
+            combo_font = self._combo_member_font() or ("Microsoft YaHei", 11, "bold")
             rating_u = rating.upper()
             if rating_u in {"T1", "T2", "T3", "T4", "T5"}:
                 badge_show, badge_bg, badge_fg = self._tier_badge_style(rating_u)
@@ -3151,25 +3679,108 @@ class HextechOverlay:
                 pady=7,
             )
             row.pack(fill="x", pady=(5, 0))
-            tk.Label(
-                row,
-                text=name,
-                bg="#101c36",
-                fg="#ecf5ff",
-                font=("Microsoft YaHei", 10, "bold"),
-                anchor="w",
-            ).pack(side="left", fill="x", expand=True)
-            tk.Label(
-                row,
-                text=badge_show,
-                bg=badge_bg,
-                fg=badge_fg,
-                font=("Microsoft YaHei", 7, "bold"),
-                padx=5,
-                pady=1,
-            ).pack(side="right")
+            if members:
+                content_row = tk.Frame(row, bg="#101c36")
+                content_row.pack(fill="x")
+                member_host = tk.Frame(content_row, bg="#101c36")
+                member_host.pack(side="left", fill="x", expand=True)
+                valid_members = [member for member in members[:4] if isinstance(member, dict)]
+                content_row.update_idletasks()
+                available_width = content_row.winfo_width() - 80
+                if available_width <= 120:
+                    available_width = 440
+                current_line = tk.Frame(member_host, bg="#101c36")
+                current_line.pack(fill="x", anchor="w")
+                current_width = 0
+                plus_width = 18
 
-    def _refresh_list(self, hextech_list):
+                for idx, member in enumerate(valid_members):
+                    member_name = str(member.get("name", "")).strip() or str(member.get("augment_id", "")).strip()
+                    chip_width = self._estimate_combo_chip_width(member_name, icon_size=32)
+                    if idx > 0:
+                        needs_break = current_width > 0 and (current_width + plus_width + 6 + chip_width) > available_width
+                        if needs_break:
+                            if current_width + plus_width <= available_width:
+                                tk.Label(
+                                    current_line,
+                                    text="+",
+                                    bg="#101c36",
+                                    fg="#8fb9ff",
+                                    font=("Microsoft YaHei", 12, "bold"),
+                                ).pack(side="left", padx=(0, 6))
+                            current_line = tk.Frame(member_host, bg="#101c36")
+                            current_line.pack(fill="x", anchor="w", pady=(4, 0))
+                            current_width = 0
+                        else:
+                            tk.Label(
+                                current_line,
+                                text="+",
+                                bg="#101c36",
+                                fg="#8fb9ff",
+                                font=("Microsoft YaHei", 12, "bold"),
+                            ).pack(side="left", padx=(0, 6))
+                            current_width += plus_width + 6
+                    elif current_width > 0 and (current_width + chip_width) > available_width:
+                        current_line = tk.Frame(member_host, bg="#101c36")
+                        current_line.pack(fill="x", anchor="w", pady=(4, 0))
+                        current_width = 0
+                    chip = tk.Frame(
+                        current_line,
+                        bg="#14274a",
+                        highlightbackground="#24466d",
+                        highlightthickness=1,
+                        padx=6,
+                        pady=5,
+                    )
+                    chip.pack(side="left", padx=(0, 6))
+                    self._make_augment_icon(
+                        chip,
+                        str(member.get("icon_url", "")).strip(),
+                        rarity=str(member.get("rarity", "")).strip(),
+                        bg="#14274a",
+                        size=32,
+                        padx=(0, 6),
+                    )
+                    tk.Label(
+                        chip,
+                        text=member_name,
+                        bg="#14274a",
+                        fg=self._rarity_name_color(member.get("rarity")),
+                        font=combo_font,
+                        anchor="w",
+                    ).pack(side="left")
+                    current_width += chip_width + 6
+                tk.Label(
+                    content_row,
+                    text=badge_show,
+                    bg=badge_bg,
+                    fg=badge_fg,
+                    font=("Microsoft YaHei", 9, "bold"),
+                    padx=6,
+                    pady=2,
+                ).pack(side="right", padx=(8, 0))
+            else:
+                fallback_row = tk.Frame(row, bg="#101c36")
+                fallback_row.pack(fill="x")
+                tk.Label(
+                    fallback_row,
+                    text=name,
+                    bg="#101c36",
+                    fg="#ecf5ff",
+                    font=combo_font,
+                    anchor="w",
+                ).pack(side="left", fill="x", expand=True)
+                tk.Label(
+                    fallback_row,
+                    text=badge_show,
+                    bg=badge_bg,
+                    fg=badge_fg,
+                    font=("Microsoft YaHei", 9, "bold"),
+                    padx=6,
+                    pady=2,
+                ).pack(side="right")
+
+    def _refresh_list(self, hextech_list, loading=False, empty_title="", empty_subtitle=""):
         for widget in self.list_frame.winfo_children():
             widget.destroy()
         if hasattr(self, "combo_frame") and self.combo_frame is not None:
@@ -3177,24 +3788,37 @@ class HextechOverlay:
                 widget.destroy()
 
         if not hextech_list:
+            title_text = str(empty_title or "").strip()
+            subtitle_text = empty_subtitle if empty_subtitle is not None else ""
+            if loading:
+                if not title_text:
+                    title_text = "数据加载中..."
+                if not subtitle_text:
+                    subtitle_text = "正在OCR识别当前3个海克斯，请稍候..."
+            else:
+                if not title_text:
+                    title_text = "当前暂无可显示的海克斯数据"
+                if not subtitle_text:
+                    subtitle_text = f"请在海克斯选择页面按{HEXTECH_MANUAL_TRIGGER_NAME}开始识别。"
             tk.Label(
                 self.list_frame,
-                text="当前暂无可显示的海克斯数据",
+                text=title_text,
                 bg="#0a1022",
                 fg="#d8e3ff",
                 font=("Microsoft YaHei", 10, "bold"),
                 anchor="w",
                 justify="left",
             ).pack(fill="x", pady=(8, 4))
-            tk.Label(
-                self.list_frame,
-                text="进入海克斯页面后会自动OCR并刷新。",
-                bg="#0a1022",
-                fg="#7f8fb2",
-                font=("Microsoft YaHei", 8),
-                anchor="w",
-                justify="left",
-            ).pack(fill="x", pady=(0, 6))
+            if subtitle_text:
+                tk.Label(
+                    self.list_frame,
+                    text=subtitle_text,
+                    bg="#0a1022",
+                    fg="#7f8fb2",
+                    font=("Microsoft YaHei", 8),
+                    anchor="w",
+                    justify="left",
+                ).pack(fill="x", pady=(0, 6))
             return
 
         sorted_list = list(hextech_list)[:3]
@@ -3212,6 +3836,8 @@ class HextechOverlay:
             items_list = item.get("items") if isinstance(item.get("items"), list) else []
             if not items_list and items_text:
                 items_list = [x.strip() for x in items_text.split("+") if x.strip()]
+            icon_url = str(item.get("icon_url", "")).strip()
+            rarity = str(item.get("rarity", "")).strip()
 
             tier = str(item.get("tier_label") or item.get("tier") or "").strip().upper()
             badge_show, badge_bg, badge_fg = self._tier_badge_style(tier if tier in {"T1", "T2", "T3", "T4", "T5"} else "T5")
@@ -3223,10 +3849,13 @@ class HextechOverlay:
 
             head = tk.Frame(card, bg="#14213d")
             head.pack(fill="x")
+            left = tk.Frame(head, bg="#14213d")
+            left.pack(side="left", fill="x", expand=True)
+            self._make_augment_icon(left, icon_url, rarity=rarity, bg="#14213d", size=38)
             tk.Label(
-                head, text=f"{i + 1}. {name_show}",
+                left, text=f"{i + 1}. {name_show}",
                 bg="#14213d", fg=name_fg, font=("Microsoft YaHei", 11, "bold"), anchor="w"
-            ).pack(side="left")
+            ).pack(side="left", fill="x", expand=True)
             tk.Label(
                 head, text=badge_show, bg=badge_bg, fg=badge_fg,
                 font=("Microsoft YaHei", 8, "bold"), padx=6, pady=2
@@ -3275,7 +3904,7 @@ class HextechOverlay:
                 title_text="推荐海克斯组合",
             )
 
-    def _refresh_preview_list(self, champion_name, rows, loading=False):
+    def _refresh_preview_list(self, champion_name, rows, loading=False, candidate_rows=None):
         if self.preview_inner_frame is None:
             return
         for widget in self.preview_inner_frame.winfo_children():
@@ -3286,6 +3915,8 @@ class HextechOverlay:
             self.preview_title_var.set(title)
         except Exception:
             pass
+
+        self._render_candidate_strengths(self.preview_inner_frame, candidate_rows or [])
 
         if not rows:
             msg = "数据加载中..."
@@ -3319,6 +3950,8 @@ class HextechOverlay:
             combo_text = str(r.get("combo_text", "")).strip()
             wr = r.get("win_rate")
             pr = r.get("pick_rate")
+            icon_url = str(r.get("icon_url", "")).strip()
+            rarity = str(r.get("rarity", "")).strip()
             badge_show, badge_bg, badge_fg = self._tier_badge_style(tier if tier in {"T1", "T2", "T3", "T4", "T5"} else "T5")
             name_fg = self._rarity_name_color(r.get("rarity"))
 
@@ -3326,7 +3959,10 @@ class HextechOverlay:
             row.pack(fill="x", pady=5)
             head = tk.Frame(row, bg="#14213d")
             head.pack(fill="x")
-            tk.Label(head, text=f"{i}. {nm}", bg="#14213d", fg=name_fg, font=("Microsoft YaHei", 11, "bold"), anchor="w").pack(side="left")
+            left = tk.Frame(head, bg="#14213d")
+            left.pack(side="left", fill="x", expand=True)
+            self._make_augment_icon(left, icon_url, rarity=rarity, bg="#14213d", size=38)
+            tk.Label(left, text=f"{i}. {nm}", bg="#14213d", fg=name_fg, font=("Microsoft YaHei", 11, "bold"), anchor="w").pack(side="left", fill="x", expand=True)
             tk.Label(head, text=badge_show, bg=badge_bg, fg=badge_fg, font=("Microsoft YaHei", 8, "bold"), padx=6, pady=2).pack(side="right")
 
             stat_row = tk.Frame(row, bg="#14213d")
@@ -3376,20 +4012,46 @@ class HextechOverlay:
                 title_text="推荐海克斯组合",
             )
 
-    def show(self, hextech_list=None, champion_name=None):
+    def show(self, hextech_list=None, champion_name=None, loading=False, empty_title="", empty_subtitle=""):
         if hextech_list is None:
             hextech_list = MOCK_HEXTECH_DATA
         if self.root is None:
             return
-        signature = self._build_show_signature(hextech_list, champion_name)
-        self.root.after(0, lambda: self._show_impl(hextech_list, champion_name, signature))
+        signature = self._build_show_signature(
+            hextech_list,
+            champion_name,
+            loading=loading,
+            empty_title=empty_title,
+            empty_subtitle=empty_subtitle,
+        )
+        self.root.after(
+            0,
+            lambda: self._show_impl(
+                hextech_list,
+                champion_name,
+                signature,
+                loading=loading,
+                empty_title=empty_title,
+                empty_subtitle=empty_subtitle,
+            ),
+        )
 
-    def _show_impl(self, hextech_list, champion_name=None, signature=None):
+    def _show_impl(self, hextech_list, champion_name=None, signature=None, loading=False, empty_title="", empty_subtitle=""):
         if self.visible and signature is not None and signature == self._last_show_signature:
             return
         self._active_champion_name = champion_name
-        self._refresh_list(hextech_list)
+        self._refresh_list(
+            hextech_list,
+            loading=loading,
+            empty_title=empty_title,
+            empty_subtitle=empty_subtitle,
+        )
         self._anchor_top_right()
+        # 先强制隐藏预览窗口，再显示海克斯窗口
+        if self.preview_root is not None:
+            self.preview_root.withdraw()
+            self.preview_visible = False
+            self._last_preview_show_signature = None
         self.root.deiconify()
         self.root.lift()
         self.root.attributes("-topmost", True)
@@ -3408,25 +4070,66 @@ class HextechOverlay:
         self.visible = False
         self._last_show_signature = None
 
-    def show_preview(self, champion_name, reco_rows, loading=False):
+    def show_preview(self, champion_name, reco_rows, loading=False, candidate_champions=None):
         if self.root is None:
             return
-        self.root.after(0, lambda: self._show_preview_impl(champion_name, reco_rows, loading))
+        candidate_rows = self._get_candidate_strength_rows(candidate_champions)
+        self.root.after(
+            0,
+            lambda: self._show_preview_impl(
+                champion_name,
+                reco_rows,
+                loading,
+                candidate_rows=candidate_rows,
+            ),
+        )
 
-    def _show_preview_impl(self, champion_name, reco_rows, loading=False):
+    def _show_preview_impl(self, champion_name, reco_rows, loading=False, candidate_rows=None):
         if self.preview_root is None:
             return
-        self._refresh_preview_list(champion_name, reco_rows or [], loading=loading)
-        self._anchor_preview_top_right()
+        # 构建预览签名用于去重，避免重复刷新和位置重置
+        preview_sig = (
+            str(champion_name or "").strip(),
+            bool(loading),
+            tuple(
+                (
+                    str(r.get("name", "")).strip(),
+                    str(r.get("icon_url", "")).strip(),
+                    str(r.get("rarity", "")).strip().lower(),
+                    str(r.get("grade", "")).upper(),
+                    str(r.get("tier", "")).strip(),
+                    str(r.get("tags", "")).strip(),
+                    str(r.get("combo_text", "")).strip(),
+                )
+                for r in (reco_rows or [])
+            ),
+            self._build_candidate_strength_signature(candidate_rows),
+            self._build_combo_signature(champion_name),
+        )
+        if self.preview_visible and preview_sig == self._last_preview_show_signature:
+            return
+        self._refresh_preview_list(
+            champion_name,
+            reco_rows or [],
+            loading=loading,
+            candidate_rows=candidate_rows,
+        )
+        if not self.preview_visible:
+            self._anchor_preview_top_right()
         if self.preview_canvas is not None:
             try:
                 self.preview_canvas.yview_moveto(0.0)
             except Exception:
                 pass
+        # 先强制隐藏海克斯窗口，再显示预览窗口
+        self.root.withdraw()
+        self.visible = False
+        self._last_show_signature = None
         self.preview_root.deiconify()
         self.preview_root.lift()
         self.preview_root.attributes("-topmost", True)
         self.preview_visible = True
+        self._last_preview_show_signature = preview_sig
 
     def hide_preview(self):
         if self.root is None:
@@ -3438,6 +4141,7 @@ class HextechOverlay:
             return
         self.preview_root.withdraw()
         self.preview_visible = False
+        self._last_preview_show_signature = None
 
     def start(self):
         t = threading.Thread(target=self._build_window, daemon=True)
@@ -3459,9 +4163,12 @@ def main():
     sys.stderr = QuietStream(sys.stderr, allow_prefixes=("[LCU] 当前悬停/选择英雄:", "[Startup]", "[Source]", "[Log]"))
     print("=" * 50)
     print("PotatoHex - 简化版")
-    print("功能：检测大厅、游戏和海克斯选择页面 (模板匹配)")
+    print(f"功能：大厅选人预览 + 游戏内按{HEXTECH_MANUAL_TRIGGER_NAME}手动识别海克斯")
     print("=" * 50)
     print()
+    if not is_running_as_admin():
+        print("[Startup] 当前未以管理员权限运行。游戏内热键可能被 LoL 拦截。")
+    print("[Startup] 如需在游戏画面上稳定显示悬浮窗，建议将 LoL 调整为无边框或窗口模式。")
     # 启动浮窗线程
     hextech_provider.start()
     overlay.start()
@@ -3470,29 +4177,284 @@ def main():
         threading.Thread(target=hextech_provider.prefetch_all_champions, daemon=True).start()
     client_was_running = False
     game_was_running = False
-    hextech_was_detected = False
     last_champ = None
     last_valid_champ = None
     last_lobby_heartbeat = 0
     last_preview_champ = None
     last_preview_signature = None
     last_champ_select_active = False
-    last_hextech_probe_text = ("", "")
-    last_hextech_refresh_ts = 0.0
-    last_hextech_overlay_signature = None
-    last_hextech_miss_ts = 0.0
-    last_hextech_miss_count = 0
+    last_hotkey_enabled = None
+    manual_scan_state = {
+        "running": False,
+        "hotkey_down": False,
+        "last_trigger_ts": 0.0,
+        "epoch": 0,
+    }
+    hotkey_runtime = {
+        "enabled": False,
+        "last_valid_champ": None,
+    }
+
+    def _normalize_live_rows(rows):
+        live_rows = list(rows or [])[:3]
+        while len(live_rows) < 3:
+            ix = len(live_rows) + 1
+            live_rows.append({
+                "index": ix,
+                "name": f"选项{ix} 未识别",
+                "grade_label": "无评级",
+                "match_pct": 0,
+                "tag_text": "无标签",
+                "author_text": "",
+            })
+        return live_rows
+
+    def _invalidate_manual_scan():
+        manual_scan_state["epoch"] += 1
+        manual_scan_state["running"] = False
+        manual_scan_state["hotkey_down"] = False
+        manual_scan_state["last_trigger_ts"] = 0.0
+
+    def _start_manual_hextech_scan(champion_name):
+        if manual_scan_state["running"]:
+            hotkey_log("[Hotkey] 忽略触发：当前已有识别任务正在运行")
+            return
+        manual_scan_state["running"] = True
+        scan_epoch = manual_scan_state["epoch"]
+        champion_snapshot = champion_name
+        display_name = champion_snapshot.split("|", 1)[0] if isinstance(champion_snapshot, str) and "|" in champion_snapshot else champion_snapshot
+        hotkey_log(f"[Hotkey] 检测到{HEXTECH_MANUAL_TRIGGER_NAME}，开始手动识别海克斯" + (f"（当前英雄：{display_name}）" if display_name else ""))
+        overlay.hide_preview()
+        overlay.show(
+            [],
+            champion_name=champion_snapshot,
+            loading=True,
+            empty_title="海克斯识别中...",
+            empty_subtitle="已捕获触发，正在OCR识别当前3个海克斯，请稍候...",
+        )
+
+        def _worker():
+            try:
+                screenshot = capture_game_screen()
+                if scan_epoch != manual_scan_state["epoch"]:
+                    return
+                if screenshot is None:
+                    hotkey_log("[Hotkey] 手动识别失败：截图为空")
+                    overlay.show(
+                        [],
+                        champion_name=champion_snapshot,
+                        loading=False,
+                        empty_title="截图失败",
+                        empty_subtitle="未能截取到游戏画面，请重试。",
+                    )
+                    return
+
+                champion_pool = hextech_provider.get_champion_recommendation_pool(champion_snapshot)
+                live_rows, _ocr_offer_debug = detect_hextech_offers_by_ocr(
+                    screenshot,
+                    champion_pool,
+                    champion_name=champion_snapshot,
+                )
+                if scan_epoch != manual_scan_state["epoch"]:
+                    return
+                if not live_rows:
+                    hotkey_log("[Hotkey] 手动识别完成：未识别到海克斯")
+                    overlay.show(
+                        [],
+                        champion_name=champion_snapshot,
+                        loading=False,
+                        empty_title="未识别到海克斯",
+                        empty_subtitle=f"请在海克斯选择页面按{HEXTECH_MANUAL_TRIGGER_NAME}触发识别。",
+                    )
+                    return
+
+                hotkey_log(f"[Hotkey] 手动识别完成：识别到 {len(live_rows)} 个海克斯")
+                overlay.show(_normalize_live_rows(live_rows), champion_name=champion_snapshot)
+            except Exception as e:
+                hotkey_log(f"[Hotkey] 手动海克斯识别异常: {e}")
+                if scan_epoch == manual_scan_state["epoch"]:
+                    overlay.show(
+                        [],
+                        champion_name=champion_snapshot,
+                        loading=False,
+                        empty_title="识别失败",
+                        empty_subtitle=str(e),
+                    )
+            finally:
+                if scan_epoch == manual_scan_state["epoch"]:
+                    manual_scan_state["running"] = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _toggle_manual_hextech_overlay():
+        if manual_scan_state["running"] or overlay.visible:
+            hotkey_log(f"[Hotkey] 检测到{HEXTECH_MANUAL_TRIGGER_NAME}，关闭海克斯悬浮窗")
+            _invalidate_manual_scan()
+            overlay.hide()
+            return
+        _start_manual_hextech_scan(hotkey_runtime["last_valid_champ"])
+
+    def _manual_hotkey_loop():
+        prev_down = False
+        while True:
+            try:
+                key_down = is_any_virtual_key_down(HEXTECH_MANUAL_TRIGGER_VKS)
+                manual_scan_state["hotkey_down"] = key_down
+                if not hotkey_runtime["enabled"]:
+                    prev_down = key_down
+                    time.sleep(HEXTECH_HOTKEY_POLL_INTERVAL)
+                    continue
+                if key_down and not prev_down:
+                    now = time.time()
+                    if (now - float(manual_scan_state["last_trigger_ts"] or 0.0)) >= HEXTECH_MANUAL_TRIGGER_COOLDOWN:
+                        manual_scan_state["last_trigger_ts"] = now
+                        _toggle_manual_hextech_overlay()
+                prev_down = key_down
+            except Exception as e:
+                hotkey_log(f"[Hotkey] 轮询监听线程异常: {e}")
+            time.sleep(HEXTECH_HOTKEY_POLL_INTERVAL)
+
+    def _manual_hotkey_low_level_hook_loop():
+        if os.name != "nt":
+            return
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        WH_KEYBOARD_LL = 13
+        WM_KEYDOWN = 0x0100
+        WM_KEYUP = 0x0101
+        WM_SYSKEYDOWN = 0x0104
+        WM_SYSKEYUP = 0x0105
+        hook_handle = None
+        hook_state = {"down": False}
+        LowLevelKeyboardProc = ctypes.WINFUNCTYPE(
+            wintypes.LRESULT,
+            ctypes.c_int,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        )
+
+        @LowLevelKeyboardProc
+        def _hook_proc(n_code, w_param, l_param):
+            try:
+                if n_code >= 0:
+                    message = int(w_param)
+                    kb_info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    matched = is_manual_trigger_key(vk_code=kb_info.vkCode, scan_code=kb_info.scanCode)
+                    if matched and message in (WM_KEYUP, WM_SYSKEYUP):
+                        hook_state["down"] = False
+                        manual_scan_state["hotkey_down"] = False
+                    elif matched and message in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                        manual_scan_state["hotkey_down"] = True
+                        if not hook_state["down"]:
+                            hook_state["down"] = True
+                            if hotkey_runtime["enabled"]:
+                                now = time.time()
+                                if (now - float(manual_scan_state["last_trigger_ts"] or 0.0)) >= HEXTECH_MANUAL_TRIGGER_COOLDOWN:
+                                    manual_scan_state["last_trigger_ts"] = now
+                                    _toggle_manual_hextech_overlay()
+            except Exception as e:
+                hotkey_log(f"[Hotkey] 低层键盘钩子异常: {e}")
+            return user32.CallNextHookEx(hook_handle, n_code, w_param, l_param)
+
+        try:
+            module_handle = kernel32.GetModuleHandleW(None)
+            hook_handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, _hook_proc, module_handle, 0)
+            if not hook_handle:
+                err = ctypes.get_last_error()
+                hotkey_log(f"[Hotkey] 低层键盘钩子注册失败: error={err}")
+                return
+            hotkey_log(f"[Hotkey] 已注册低层键盘钩子监听: {HEXTECH_MANUAL_TRIGGER_NAME}")
+            msg = wintypes.MSG()
+            while True:
+                result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if result == 0:
+                    break
+                if result == -1:
+                    err = ctypes.get_last_error()
+                    hotkey_log(f"[Hotkey] 低层键盘钩子消息循环失败: error={err}")
+                    break
+        except Exception as e:
+            hotkey_log(f"[Hotkey] 低层键盘钩子监听异常: {e}")
+        finally:
+            if hook_handle:
+                try:
+                    user32.UnhookWindowsHookEx(hook_handle)
+                except Exception:
+                    pass
+
+    def _manual_hotkey_message_loop():
+        if os.name != "nt":
+            return
+        user32 = ctypes.windll.user32
+        WM_HOTKEY = 0x0312
+        registered = []
+        try:
+            for idx, vk_code in enumerate(HEXTECH_MANUAL_TRIGGER_VKS, 1):
+                try:
+                    ok = bool(user32.RegisterHotKey(None, idx, 0, int(vk_code)))
+                except Exception:
+                    ok = False
+                if ok:
+                    registered.append((idx, vk_code))
+                    hotkey_log(f"[Hotkey] 已注册系统热键监听: {HEXTECH_MANUAL_TRIGGER_NAME}, vk=0x{int(vk_code):02X}")
+                else:
+                    err = ctypes.get_last_error()
+                    hotkey_log(f"[Hotkey] 系统热键注册失败: vk=0x{int(vk_code):02X}, error={err}")
+
+            if not registered:
+                hotkey_log("[Hotkey] 未注册到任何系统热键，继续使用轮询监听回退。")
+                return
+
+            msg = wintypes.MSG()
+            while True:
+                result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if result == 0:
+                    break
+                if result == -1:
+                    err = ctypes.get_last_error()
+                    hotkey_log(f"[Hotkey] GetMessageW 失败: error={err}")
+                    break
+                if msg.message == WM_HOTKEY:
+                    if not hotkey_runtime["enabled"]:
+                        continue
+                    now = time.time()
+                    if (now - float(manual_scan_state["last_trigger_ts"] or 0.0)) >= HEXTECH_MANUAL_TRIGGER_COOLDOWN:
+                        manual_scan_state["last_trigger_ts"] = now
+                        _toggle_manual_hextech_overlay()
+        except Exception as e:
+            hotkey_log(f"[Hotkey] 系统热键监听异常: {e}")
+        finally:
+            for hotkey_id, _vk in registered:
+                try:
+                    user32.UnregisterHotKey(None, int(hotkey_id))
+                except Exception:
+                    pass
+
+    threading.Thread(target=_manual_hotkey_loop, daemon=True).start()
+    threading.Thread(target=_manual_hotkey_low_level_hook_loop, daemon=True).start()
+    threading.Thread(target=_manual_hotkey_message_loop, daemon=True).start()
+
     try:
         while True:
             client_running = is_league_client_running()
             game_running = is_game_running()
+            hotkey_runtime["enabled"] = bool(client_running or game_running)
+            hotkey_runtime["last_valid_champ"] = last_valid_champ
+            if hotkey_runtime["enabled"] != last_hotkey_enabled:
+                hotkey_log(
+                    f"[Hotkey] 热键启用状态变更: enabled={hotkey_runtime['enabled']}, "
+                    f"client_running={client_running}, game_running={game_running}"
+                )
+                last_hotkey_enabled = hotkey_runtime["enabled"]
             def _reset_match_state():
-                nonlocal last_champ, last_valid_champ, last_preview_champ, last_preview_signature, last_champ_select_active
+                nonlocal last_champ, last_valid_champ, last_preview_champ, last_preview_signature, last_champ_select_active, last_hotkey_enabled
                 last_champ = None
                 last_valid_champ = None
                 last_preview_champ = None
                 last_preview_signature = None
                 last_champ_select_active = False
+                hotkey_runtime["last_valid_champ"] = None
+                last_hotkey_enabled = None
 
             # 大厅状态变化
             if client_running:
@@ -3503,7 +4465,8 @@ def main():
                 if client_was_running:
                     client_was_running = False
                     game_was_running = False
-                    hextech_was_detected = False
+                    hotkey_runtime["enabled"] = False
+                    _invalidate_manual_scan()
                     _reset_match_state()
                     overlay.hide()
                     overlay.hide_preview()
@@ -3514,7 +4477,7 @@ def main():
             if not game_running:
                 if game_was_running:
                     game_was_running = False
-                    hextech_was_detected = False
+                    _invalidate_manual_scan()
                     _reset_match_state()
                     overlay.hide()
                     overlay.hide_preview()
@@ -3524,9 +4487,12 @@ def main():
                     last_champ = "__no_cred__"
                 else:
                     load_champion_map(port, token)
-                    champ_select_active, champ = get_champ_select_state()
+                    champ_select_details = get_champ_select_details()
+                    champ_select_active = bool(champ_select_details.get("active"))
+                    champ = champ_select_details.get("current_champion")
+                    candidate_champs = list(champ_select_details.get("candidate_champions") or [])
                     if champ_select_active and not last_champ_select_active:
-                        overlay.show_preview("", [], loading=True)
+                        overlay.show_preview("", [], loading=True, candidate_champions=candidate_champs)
                         last_preview_signature = "__loading__"
                         last_preview_champ = None
                     last_champ_select_active = champ_select_active
@@ -3565,6 +4531,7 @@ def main():
                         )
                         sig = (
                             champ,
+                            tuple(str(x).strip() for x in candidate_champs),
                             tuple(
                                 (
                                     str(r.get("name", "")).strip(),
@@ -3577,15 +4544,26 @@ def main():
                             ),
                         )
                         if top_rows and sig != last_preview_signature:
-                            overlay.show_preview(display_champ, top_rows, loading=(not has_cached))
+                            overlay.show_preview(
+                                display_champ,
+                                top_rows,
+                                loading=(not has_cached),
+                                candidate_champions=candidate_champs,
+                            )
                             last_preview_signature = sig
                             last_preview_champ = champ
                         elif has_cached and sig != last_preview_signature:
-                            overlay.show_preview(display_champ, top_rows, loading=False)
+                            overlay.show_preview(
+                                display_champ,
+                                top_rows,
+                                loading=False,
+                                candidate_champions=candidate_champs,
+                            )
                             last_preview_signature = sig
                             last_preview_champ = champ
                         last_champ = champ
                         last_valid_champ = champ
+                        hotkey_runtime["last_valid_champ"] = champ
                     else:
                         if last_champ != "__no_champ__":
                             if last_valid_champ:
@@ -3598,7 +4576,7 @@ def main():
                         if not champ_select_active:
                             last_preview_signature = None
                         if champ_select_active:
-                            overlay.show_preview("", [], loading=True)
+                            overlay.show_preview("", [], loading=True, candidate_champions=candidate_champs)
                         else:
                             overlay.hide_preview()
                 time.sleep(1)
@@ -3606,110 +4584,14 @@ def main():
             if game_running:
                 if not game_was_running:
                     print("[OK] 游戏已启动！")
+                    print(f"[Hotkey] 在海克斯选择页面按{HEXTECH_MANUAL_TRIGGER_NAME}即可手动识别当前3个海克斯")
                     game_was_running = True
-                    hextech_was_detected = False
+                    _invalidate_manual_scan()
                     overlay.hide_preview()
                     last_preview_signature = None
                     last_champ_select_active = False
-                    last_hextech_probe_text = ("", "")
-                    last_hextech_refresh_ts = 0.0
-                    last_hextech_overlay_signature = None
-                    last_hextech_miss_ts = 0.0
-                    last_hextech_miss_count = 0
-                # 检测海克斯页面
-                screenshot = capture_game_screen()
-                if screenshot is not None:
-                    hextech_probe_ok, hextech_left_text, hextech_middle_text, hextech_right_text, hextech_rois, hextech_roi_boxes, hextech_probe_debug = probe_hextech_screen_by_left_and_middle_cards(screenshot)
-                    if hextech_probe_ok:
-                        champion_pool = hextech_provider.get_champion_recommendation_pool(last_valid_champ)
-                        now = time.time()
-                        probe_signature = (hextech_left_text, hextech_middle_text, hextech_right_text)
-                        need_refresh = (
-                            (not hextech_was_detected)
-                            or (probe_signature != last_hextech_probe_text)
-                            or ((now - last_hextech_refresh_ts) >= HEXTECH_ACTIVE_OCR_REFRESH_INTERVAL)
-                        )
-                        if need_refresh:
-                            live_rows, ocr_offer_debug = detect_hextech_offers_by_ocr(
-                                screenshot,
-                                champion_pool,
-                                champion_name=last_valid_champ,
-                                screen_probe={
-                                    "rois": hextech_rois,
-                                    "roi_boxes": hextech_roi_boxes,
-                                    "left_text": hextech_left_text,
-                                },
-                            )
-                            if not live_rows:
-                                live_rows = []
-                            while len(live_rows) < 3:
-                                ix = len(live_rows) + 1
-                                live_rows.append({
-                                    "index": ix,
-                                    "name": f"选项{ix} 未识别",
-                                    "grade_label": "无评级",
-                                    "match_pct": 0,
-                                    "tag_text": "无标签",
-                                    "author_text": "",
-                                })
-                            overlay_signature = (
-                                hextech_left_text,
-                                tuple(
-                                    (
-                                        str(r.get("name", "")).strip(),
-                                        str(r.get("grade_label", "")).strip(),
-                                        str(r.get("match_pct", "")).strip(),
-                                        str(r.get("tag_text", "")).strip(),
-                                        str(r.get("author_text", "")).strip(),
-                                    )
-                                    for r in live_rows
-                                ),
-                            )
-                            if overlay_signature != last_hextech_overlay_signature:
-                                overlay.show(live_rows, champion_name=last_valid_champ)
-                                last_hextech_overlay_signature = overlay_signature
-                            last_hextech_refresh_ts = now
-                            last_hextech_probe_text = probe_signature
-                        last_hextech_miss_ts = 0.0
-                        last_hextech_miss_count = 0
-                        if not hextech_was_detected:
-                            hextech_was_detected = True
-                            global_aug_index = hextech_provider.get_global_augment_index()
-                            detected_tiers, ocr_debug = detect_hextech_offer_tiers_by_ocr(
-                                screenshot, champion_pool, global_augment_index=global_aug_index
-                            )
-                            if detected_tiers:
-                                tiers_text = "/".join(sorted(detected_tiers))
-                            else:
-                                if not HEXTECH_OCR_ONLY:
-                                    detected_tiers, tier_debug = detect_hextech_offer_tiers(screenshot)
-                                    if detected_tiers:
-                                        tiers_text = "/".join(sorted(detected_tiers))
-                    else:
-                        if hextech_was_detected:
-                            now = time.time()
-                            if last_hextech_miss_ts == 0.0:
-                                last_hextech_miss_ts = now
-                                last_hextech_miss_count = 1
-                            else:
-                                last_hextech_miss_count += 1
-                            if (
-                                last_hextech_miss_count >= HEXTECH_CLOSE_MISS_LIMIT
-                                or (now - last_hextech_miss_ts) >= HEXTECH_CLOSE_GRACE_SECONDS
-                            ):
-                                hextech_was_detected = False
-                                last_hextech_probe_text = ("", "")
-                                last_hextech_refresh_ts = 0.0
-                                last_hextech_overlay_signature = None
-                                last_hextech_miss_ts = 0.0
-                                last_hextech_miss_count = 0
-                                overlay.hide()  # ← 页面关闭时隐藏
-                        else:
-                            last_hextech_miss_ts = 0.0
-                            last_hextech_miss_count = 0
-                else:
-                    pass
-            time.sleep(HEXTECH_ACTIVE_LOOP_INTERVAL if hextech_was_detected else HEXTECH_MAIN_LOOP_INTERVAL)
+            idle_interval = HEXTECH_IN_GAME_MAIN_LOOP_INTERVAL if game_running else HEXTECH_MAIN_LOOP_INTERVAL
+            time.sleep(idle_interval)
     except KeyboardInterrupt:
         print("\n[*] 程序已中断")
         sys.exit(0)
@@ -3721,5 +4603,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
