@@ -1,4 +1,4 @@
-﻿<div align="center">
+<div align="center">
   <h1 align="center">
     <img src="assets/icon.png" alt="PotatoHex" width="190">
     <br/>
